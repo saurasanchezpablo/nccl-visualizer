@@ -1,12 +1,14 @@
 
 #!/usr/bin/env python3
 """
-NCCL Debug Log Parser and Analyzer - VERSIÓN MEJORADA
+NCCL Debug Log Parser and Analyzer
 Parsea logs de NCCL generados con NCCL_DEBUG=INFO
-Soporta formato: hostname:pid:tid [rank] NCCL INFO operation: ...
+Soporta formato con y sin timestamps:
+  - Con timestamp: [2025-10-27 17:36:20.330]as02r3b05:2840695:2840918 [2] NCCL INFO ...
+  - Sin timestamp: as05r3b03:1912985:1912985 [0] NCCL INFO ...
 
 Uso:
-    python nccl_parser_v2.py <log_file> [--output <output_prefix>]
+    python nccl_parser.py <log_file> [--output <output_prefix>]
 """
 
 import re
@@ -19,11 +21,12 @@ import argparse
 import json
 
 class NCCLLogParser:
-    """Parser para logs de NCCL DEBUG"""
+    """Parser para logs de NCCL DEBUG con timestamps opcionales"""
 
-    # Patrón mejorado para operaciones colectivas
+    # Patrón mejorado para operaciones colectivas (timestamp opcional)
     COLLECTIVE_PATTERN = re.compile(
-        r'^\S+:\d+:\d+\s+'  # hostname:pid:tid
+        r'^(?:\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)\])?'  # timestamp opcional
+        r'\S+:\d+:\d+\s+'  # hostname:pid:tid
         r'\[(\d+)\]\s+'  # rank
         r'NCCL INFO\s+'
         r'(AllReduce|AllGather|Broadcast|ReduceScatter|Reduce|AllToAll):\s*'  # operation
@@ -35,9 +38,10 @@ class NCCLLogParser:
         r'.*\[nranks=(\d+)\]'  # nranks
     )
 
-    # Patrón mejorado para operaciones P2P
+    # Patrón mejorado para operaciones P2P Send (timestamp opcional)
     P2P_SEND_PATTERN = re.compile(
-        r'^\S+:\d+:\d+\s+'  # hostname:pid:tid
+        r'^(?:\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)\])?'  # timestamp opcional
+        r'\S+:\d+:\d+\s+'  # hostname:pid:tid
         r'\[(\d+)\]\s+'  # rank
         r'NCCL INFO\s+'
         r'Send:\s*'  # operation
@@ -50,8 +54,10 @@ class NCCLLogParser:
         r'.*\[nranks=(\d+)\]'  # nranks
     )
 
+    # Patrón mejorado para operaciones P2P Recv (timestamp opcional)
     P2P_RECV_PATTERN = re.compile(
-        r'^\S+:\d+:\d+\s+'  # hostname:pid:tid
+        r'^(?:\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)\])?'  # timestamp opcional
+        r'\S+:\d+:\d+\s+'  # hostname:pid:tid
         r'\[(\d+)\]\s+'  # rank
         r'NCCL INFO\s+'
         r'Recv:\s*'  # operation
@@ -82,15 +88,25 @@ class NCCLLogParser:
         self.communications = []
         self.p2p_communications = []
         self.parse_errors = []
+        self.has_timestamps = False
 
     def parse_file(self, log_file):
         """Parse el archivo de log completo"""
         print(f"Parseando archivo: {log_file}")
 
         line_count = 0
+        first_timestamp_check = True
+
         with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
             for line_num, line in enumerate(f, 1):
                 line_count += 1
+
+                # Detectar si el log tiene timestamps (solo en primera operación)
+                if first_timestamp_check and 'NCCL INFO' in line:
+                    if line.strip().startswith('[') and ']' in line[:30]:
+                        self.has_timestamps = True
+                        print("✓ Detectados timestamps en el log")
+                    first_timestamp_check = False
 
                 # Intentar parsear como operación colectiva
                 match = self.COLLECTIVE_PATTERN.search(line)
@@ -123,7 +139,7 @@ class NCCLLogParser:
     def _parse_collective(self, match, line_num, line):
         """Parse una operación colectiva"""
         try:
-            rank, operation, opcount, sendbuff, recvbuff, count, datatype, nranks = match.groups()
+            timestamp, rank, operation, opcount, sendbuff, recvbuff, count, datatype, nranks = match.groups()
 
             rank = int(rank)
             count = int(count)
@@ -134,7 +150,7 @@ class NCCLLogParser:
             element_size = self.DATATYPE_SIZES.get(datatype, 4)
             data_size_bytes = count * element_size
 
-            self.communications.append({
+            comm_data = {
                 'line': line_num,
                 'rank': rank,
                 'operation': operation,
@@ -147,14 +163,24 @@ class NCCLLogParser:
                 'nranks': nranks,
                 'sendbuff': sendbuff,
                 'recvbuff': recvbuff,
-            })
+            }
+
+            # Agregar timestamp si existe
+            if timestamp:
+                comm_data['timestamp'] = timestamp
+                try:
+                    comm_data['datetime'] = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S.%f')
+                except:
+                    pass
+
+            self.communications.append(comm_data)
         except Exception as e:
             self.parse_errors.append(line_num)
 
     def _parse_p2p_send(self, match, line_num, line):
         """Parse una operación Send"""
         try:
-            rank, opcount, sendbuff, recvbuff, count, datatype, peer, nranks = match.groups()
+            timestamp, rank, opcount, sendbuff, recvbuff, count, datatype, peer, nranks = match.groups()
 
             rank = int(rank)
             count = int(count)
@@ -166,7 +192,7 @@ class NCCLLogParser:
             element_size = self.DATATYPE_SIZES.get(datatype, 4)
             data_size_bytes = count * element_size
 
-            self.p2p_communications.append({
+            p2p_data = {
                 'line': line_num,
                 'rank': rank,
                 'operation': 'Send',
@@ -179,14 +205,24 @@ class NCCLLogParser:
                 'data_size_gb': data_size_bytes / (1024 * 1024 * 1024),
                 'nranks': nranks,
                 'buffer': sendbuff,
-            })
+            }
+
+            # Agregar timestamp si existe
+            if timestamp:
+                p2p_data['timestamp'] = timestamp
+                try:
+                    p2p_data['datetime'] = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S.%f')
+                except:
+                    pass
+
+            self.p2p_communications.append(p2p_data)
         except Exception as e:
             self.parse_errors.append(line_num)
 
     def _parse_p2p_recv(self, match, line_num, line):
         """Parse una operación Recv"""
         try:
-            rank, opcount, sendbuff, recvbuff, count, datatype, peer, nranks = match.groups()
+            timestamp, rank, opcount, sendbuff, recvbuff, count, datatype, peer, nranks = match.groups()
 
             rank = int(rank)
             count = int(count)
@@ -198,7 +234,7 @@ class NCCLLogParser:
             element_size = self.DATATYPE_SIZES.get(datatype, 4)
             data_size_bytes = count * element_size
 
-            self.p2p_communications.append({
+            p2p_data = {
                 'line': line_num,
                 'rank': rank,
                 'operation': 'Recv',
@@ -211,7 +247,17 @@ class NCCLLogParser:
                 'data_size_gb': data_size_bytes / (1024 * 1024 * 1024),
                 'nranks': nranks,
                 'buffer': recvbuff,
-            })
+            }
+
+            # Agregar timestamp si existe
+            if timestamp:
+                p2p_data['timestamp'] = timestamp
+                try:
+                    p2p_data['datetime'] = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S.%f')
+                except:
+                    pass
+
+            self.p2p_communications.append(p2p_data)
         except Exception as e:
             self.parse_errors.append(line_num)
 
@@ -262,9 +308,10 @@ class NCCLLogParser:
         analysis['rank_operation_matrix'] = rank_op_matrix
 
         # Top operaciones por tamaño de datos
-        top_operations = df.nlargest(20, 'data_size_bytes')[
-            ['rank', 'operation', 'count', 'data_size_mb', 'opcount', 'line']
-        ]
+        cols = ['rank', 'operation', 'count', 'data_size_mb', 'opcount', 'line']
+        if 'timestamp' in df.columns:
+            cols.insert(0, 'timestamp')
+        top_operations = df.nlargest(20, 'data_size_bytes')[cols]
         analysis['top_data_operations'] = top_operations
 
         # Estadísticas globales
@@ -274,8 +321,20 @@ class NCCLLogParser:
             'total_data_gb': df['data_size_gb'].sum(),
             'num_ranks': df['rank'].nunique(),
             'operations_per_rank': df.groupby('rank').size().to_dict(),
-            'avg_data_per_operation_mb': df['data_size_mb'].mean()
+            'avg_data_per_operation_mb': df['data_size_mb'].mean(),
+            'has_timestamps': 'timestamp' in df.columns
         }
+
+        # Análisis temporal si hay timestamps
+        if 'datetime' in df.columns:
+            df_time = df[df['datetime'].notna()].copy()
+            if len(df_time) > 0:
+                df_time = df_time.sort_values('datetime')
+                time_range = (df_time['datetime'].max() - df_time['datetime'].min()).total_seconds()
+                analysis['global_stats']['time_range_seconds'] = time_range
+                analysis['global_stats']['first_timestamp'] = str(df_time['datetime'].min())
+                analysis['global_stats']['last_timestamp'] = str(df_time['datetime'].max())
+                analysis['global_stats']['operations_per_second'] = len(df_time) / time_range if time_range > 0 else 0
 
         return analysis
 
@@ -410,6 +469,14 @@ class NCCLLogParser:
             print(f"Número de ranks: {stats['num_ranks']}")
             print(f"Datos totales transferidos: {stats['total_data_gb']:.2f} GB ({stats['total_data_mb']:.2f} MB)")
             print(f"Datos promedio por operación: {stats['avg_data_per_operation_mb']:.2f} MB")
+
+            if stats.get('has_timestamps'):
+                print(f"\n### INFORMACIÓN TEMPORAL ###")
+                print(f"Primer timestamp: {stats.get('first_timestamp')}")
+                print(f"Último timestamp: {stats.get('last_timestamp')}")
+                print(f"Duración total: {stats.get('time_range_seconds', 0):.2f} segundos")
+                print(f"Operaciones por segundo: {stats.get('operations_per_second', 0):.2f} ops/s")
+
             print(f"\nOperaciones por tipo:")
             print(coll['operation_summary'])
             print(f"\nOperaciones por rank (Top 10):")
@@ -427,15 +494,19 @@ class NCCLLogParser:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Parse y analiza logs de NCCL DEBUG - Versión mejorada',
+        description='Parse y analiza logs de NCCL DEBUG - Versión 3 con timestamps',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ejemplos de uso:
-  python nccl_parser.py nccl_debug.log
-  python nccl_parser.py nccl_debug.log --output results/analysis
+  python nccl_parser_v3.py nccl_debug.log
+  python nccl_parser_v3.py nccl_debug.log --output results/analysis
 
 Para generar logs NCCL:
+  # Sin timestamps
   NCCL_DEBUG=INFO <tu_comando> 2>&1 | tee nccl_debug.log
+
+  # Con timestamps
+  NCCL_DEBUG=INFO <tu_comando> 2>&1 | ts '[%Y-%m-%d %H:%M:%.S]' | tee nccl_debug.log
         """
     )
 
